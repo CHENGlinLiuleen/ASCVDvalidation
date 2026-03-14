@@ -1,0 +1,771 @@
+---
+title: "Cross sectional for nhanes"
+author: "Chenglin Liu"
+date: "2025-09-30"
+output: html_document
+---
+
+# 1.数据读取，包读入. data loading for nhanes
+
+```{r}
+setwd('C:/0822/New')
+library(MatchIt)
+library(cobalt)
+library(foreign)
+library(dplyr)
+library(arsenal)
+library(survey)
+library(tableone)
+library(mgcv)
+library(modelsummary)
+library(splines)
+library(writexl)
+library(purrr)
+library(car)
+library(patchwork)
+#write.csv(dat,file='Fulldata_with_mortality.csv',row.names=FALSE)
+#dat<-read.csv('AHAmetadata.csv')
+dat<-read.csv('nhanes.csv')
+
+dat$outcome_AHA<- case_when(
+  dat$AHA>0.075 ~ 1,
+  dat$AHA<0.075 ~ 0
+)
+dat$hypertensionstatus<- case_when(
+  dat$Mean_DBP>90 | dat$Mean_SBP >140 ~ 1,
+  dat$Hypertensiontreated=='YES' ~1,
+  TRUE~ 0
+  )
+dat$HDL<-dat$HDLCholesterol
+table(dat$hypertensionstatus,useNA = 'ifany')
+```
+
+# 2.基线描述 baseline
+
+```{r}
+
+target_vars <- c('outcome_AHA')
+
+# 遍历目标变量组
+for (target_var in target_vars) {
+  # 设置复杂抽样设计
+  options(survey.lonely.psu = "adjust")
+  study_design <- svydesign(
+    data = dat,
+    id = ~SDMVPSU,
+    strata = ~SDMVSTRA,
+    weights = ~weightnew,
+    nest = TRUE
+  )
+
+  # 定义描述性统计的变量
+  vars <- c(
+    'age', 'sex', 'race', 'marital', 'education', 'pir','bmi', 'drink',
+    'smokingstatus_final', 'diabetes', 'Mean_DBP', 'Mean_SBP', 'hypertensionstatus',
+    'TotalCholesterol', 'nonHDL', 'HDLCholesterol', 'ALP', 'ALT', 'LDH', 'GGT', 'AST',
+    'Albumin', 'Globulin', 'A.G', 'AST.ALT', 'HbA1c_percentage', 'year','triglyceride','Hypertensiontreated','LDL'
+  )
+  
+  # 定义因子变量
+  fvars <- c(
+    'sex', 'race', 'marital', 'education', 'year', 'smokingstatus_final', 'diabetes',
+     'drink', 'hypertensionstatus','Hypertensiontreated'
+  )
+  
+  # 加权描述性统计表
+  Svytabl <- svyCreateTableOne(
+    vars = vars,
+    strata = target_var,
+    data = study_design,
+    factorVars = fvars
+  )
+  weighted_table <- as.data.frame(print(Svytabl, showAllLevels = TRUE))
+  write.csv(weighted_table, file = paste0('base_', target_var, '_weighted.csv'))
+  
+  # 未加权描述性统计表
+  Svytabl2 <- CreateTableOne(
+    vars = vars,
+    strata = target_var,
+    data = dat,
+    factorVars = fvars
+  )
+  unweighted_table <- as.data.frame(print(Svytabl2, showAllLevels = TRUE))
+  write.csv(unweighted_table, file = paste0('base_', target_var, '_unweighted.csv'))
+}
+```
+
+# 3. 三分位趋势性分析
+
+```{r}
+#dat<-read.csv('AHAmetadata.csv')
+dat$outcome_AHA<- case_when(
+  dat$AHA>0.075 ~ 1,
+  dat$AHA<0.075 ~ 0
+)
+dat$hypertensionstatus<- case_when(
+  dat$Mean_DBP>90 | dat$Mean_SBP >140 ~ 1,
+  dat$Hypertensiontreated=='YES' ~1,
+  TRUE~ 0
+  )
+target_vars <- c('outcome_AHA')
+variables <- c('ALP', 'ALT', 'LDH', 'GGT', 'AST', 'Albumin', 'Globulin', 'AST.ALT', 'A.G')
+#dat <- dat %>%
+#  mutate(across(c(ALT, ALP, LDH, GGT, AST, Albumin, Globulin), log))
+
+options(survey.lonely.psu = "adjust")
+study_design <- svydesign(
+  data = dat,
+  id = ~SDMVPSU,
+  strata = ~SDMVSTRA,
+  weights = ~weightnew,
+  nest = TRUE
+)
+
+sensitivity_results <- data.frame(
+  outcome = character(),
+  var = character(),
+  t1_range = character(),
+  t2_range = character(),
+  t3_range = character(),
+  t1_count_low = numeric(),
+  t2_count_low = numeric(),
+  t3_count_low = numeric(),
+  t1_count_high = numeric(),
+  t2_count_high = numeric(),
+  t3_count_high = numeric(),
+  t1_median = numeric(),
+  t2_median = numeric(),
+  t3_median = numeric(),
+  OR_t2 = numeric(),
+  CI_t2_lower = numeric(),
+  CI_t2_upper = numeric(),
+  p_t2 = numeric(),
+  OR_t3 = numeric(),
+  CI_t3_lower = numeric(),
+  CI_t3_upper = numeric(),
+  p_t3 = numeric(),
+  OR_continuous = numeric(),
+  CI_continuous_lower = numeric(),
+  CI_continuous_upper = numeric(),
+  p_continuous = numeric(),
+  stringsAsFactors = FALSE
+)
+
+for (target_var in target_vars) {
+  for (var in variables) {
+    quantiles <- quantile(dat[[var]], probs = c(0, 1/3, 2/3, 1), na.rm = TRUE)
+
+    # 创建等级变量（3段）
+    dat[[paste0(var, "_ordinal")]] <- cut(
+      dat[[var]],
+      breaks = quantiles,
+      include.lowest = TRUE,
+      labels = c(1, 2, 3)
+    )
+
+    # 区间范围和人数统计
+    t1_range <- sprintf("[%.2f, %.2f]", quantiles[1], quantiles[2])
+    t2_range <- sprintf("(%.2f, %.2f]", quantiles[2], quantiles[3])
+    t3_range <- sprintf("(%.2f, %.2f]", quantiles[3], quantiles[4])
+    #
+    high<-subset(dat,subset=dat$outcome_AHA==1)
+    low<- subset(dat,subset = dat$outcome_AHA==0)
+    t1_count_low <- sum(low[[var]] <= quantiles[2], na.rm = TRUE)
+    t2_count_low <- sum(low[[var]] > quantiles[2] & low[[var]] <= quantiles[3], na.rm = TRUE)
+    t3_count_low <- sum(low[[var]] > quantiles[3], na.rm = TRUE)
+    t1_count_high <- sum(high[[var]] <= quantiles[2], na.rm = TRUE)
+    t2_count_high <- sum(high[[var]] > quantiles[2] & high[[var]] <= quantiles[3], na.rm = TRUE)
+    t3_count_high <- sum(high[[var]] > quantiles[3], na.rm = TRUE)
+    options(survey.lonely.psu = "adjust")
+    study_design <- svydesign(
+      data = dat,
+      id = ~SDMVPSU,
+      strata = ~SDMVSTRA,
+      weights = ~weightnew,
+      nest = TRUE)
+    # 模型 1：等级自变量回归分析（以 t1 为参考组）
+    formula_ordinal <- as.formula(paste0(
+      target_var, " ~ ", var, "_ordinal+sex+age+pir+education+marital+race+HDLCholesterol+diabetes+
+      hypertensionstatus+smokingstatus_final"
+    ))
+    model_ordinal <- svyglm(formula_ordinal, design = study_design, family = quasibinomial())
+
+    # 提取 OR 和 95% CI
+    coef_ordinal <- summary(model_ordinal)$coefficients
+    OR_t2 <- exp(coef_ordinal[paste0(var, "_ordinal2"), "Estimate"])
+    CI_t2_lower <- exp(coef_ordinal[paste0(var, "_ordinal2"), "Estimate"] - 1.96 * coef_ordinal[paste0(var, "_ordinal2"), "Std. Error"])
+    CI_t2_upper <- exp(coef_ordinal[paste0(var, "_ordinal2"), "Estimate"] + 1.96 * coef_ordinal[paste0(var, "_ordinal2"), "Std. Error"])
+    p_t2 <- coef_ordinal[paste0(var, "_ordinal2"), "Pr(>|t|)"]
+
+    OR_t3 <- exp(coef_ordinal[paste0(var, "_ordinal3"), "Estimate"])
+    CI_t3_lower <- exp(coef_ordinal[paste0(var, "_ordinal3"), "Estimate"] - 1.96 * coef_ordinal[paste0(var, "_ordinal3"), "Std. Error"])
+    CI_t3_upper <- exp(coef_ordinal[paste0(var, "_ordinal3"), "Estimate"] + 1.96 * coef_ordinal[paste0(var, "_ordinal3"), "Std. Error"])
+    p_t3 <- coef_ordinal[paste0(var, "_ordinal3"), "Pr(>|t|)"]
+
+    # 替换变量值为中位数
+    medians <- c(
+      median(dat[[var]][dat[[var]] <= quantiles[2]], na.rm = TRUE),
+      median(dat[[var]][dat[[var]] > quantiles[2] & dat[[var]] <= quantiles[3]], na.rm = TRUE),
+      median(dat[[var]][dat[[var]] > quantiles[3]], na.rm = TRUE)
+    )
+    dat[[paste0(var, "_continuous")]] <- NA
+    dat[[paste0(var, "_continuous")]][dat[[paste0(var, "_ordinal")]] == 1] <- medians[1]
+    dat[[paste0(var, "_continuous")]][dat[[paste0(var, "_ordinal")]] == 2] <- medians[2]
+    dat[[paste0(var, "_continuous")]][dat[[paste0(var, "_ordinal")]] == 3] <- medians[3]
+    options(survey.lonely.psu = "adjust")
+    study_design <- svydesign(
+      data = dat,
+      id = ~SDMVPSU,
+      strata = ~SDMVSTRA,
+      weights = ~weightnew,
+      nest = TRUE)
+    # 连续变量回归分析
+    formula_continuous <- as.formula(paste0(
+      target_var, " ~ ", var, "_continuous+sex+age+pir+education+marital+race+HDLCholesterol+diabetes+
+      hypertensionstatus+smokingstatus_final"
+    ))
+    model_continuous <- svyglm(formula_continuous, design = study_design, family = quasibinomial())
+
+    # 提取连续变量的 OR 和 95% CI
+    coef_continuous <- summary(model_continuous)$coefficients
+    OR_continuous <- exp(coef_continuous[paste0(var, "_continuous"), "Estimate"])
+    CI_continuous_lower <- exp(coef_continuous[paste0(var, "_continuous"), "Estimate"] - 1.96 * coef_continuous[paste0(var, "_continuous"), "Std. Error"])
+    CI_continuous_upper <- exp(coef_continuous[paste0(var, "_continuous"), "Estimate"] + 1.96 * coef_continuous[paste0(var, "_continuous"), "Std. Error"])
+    p_continuous <- coef_continuous[paste0(var, "_continuous"), "Pr(>|t|)"]
+
+    # 保存结果
+    sensitivity_results <- rbind(
+      sensitivity_results,
+      data.frame(
+        outcome = target_var,
+        var = var,
+        t1_range = t1_range,
+        t2_range = t2_range,
+        t3_range = t3_range,
+        t1_count_low = t1_count_low,
+        t2_count_low = t2_count_low,
+        t3_count_low = t3_count_low,
+        t1_count_high = t1_count_high,
+        t2_count_high = t2_count_high,
+        t3_count_high = t3_count_high,
+        t1_median = medians[1],
+        t2_median = medians[2],
+        t3_median = medians[3],
+        OR_t2 = OR_t2,
+        CI_t2_lower = CI_t2_lower,
+        CI_t2_upper = CI_t2_upper,
+        p_t2 = p_t2,
+        OR_t3 = OR_t3,
+        CI_t3_lower = CI_t3_lower,
+        CI_t3_upper = CI_t3_upper,
+        p_t3 = p_t3,
+        OR_continuous = OR_continuous,
+        CI_continuous_lower = CI_continuous_lower,
+        CI_continuous_upper = CI_continuous_upper,
+        p_continuous = p_continuous,
+        stringsAsFactors = FALSE
+      )
+    )
+  }
+}
+summary(model_ordinal)
+#model 2#
+write.csv(sensitivity_results, "sensitivity_model2.csv", row.names = FALSE)
+
+
+
+#model 1#
+
+sensitivity_results <- data.frame(
+  outcome = character(),
+  var = character(),
+  t1_range = character(),
+  t2_range = character(),
+  t3_range = character(),
+  t1_count_low = numeric(),
+  t2_count_low = numeric(),
+  t3_count_low = numeric(),
+  t1_count_high = numeric(),
+  t2_count_high = numeric(),
+  t3_count_high = numeric(),
+  t1_median = numeric(),
+  t2_median = numeric(),
+  t3_median = numeric(),
+  OR_t2 = numeric(),
+  CI_t2_lower = numeric(),
+  CI_t2_upper = numeric(),
+  p_t2 = numeric(),
+  OR_t3 = numeric(),
+  CI_t3_lower = numeric(),
+  CI_t3_upper = numeric(),
+  p_t3 = numeric(),
+  OR_continuous = numeric(),
+  CI_continuous_lower = numeric(),
+  CI_continuous_upper = numeric(),
+  p_continuous = numeric(),
+  stringsAsFactors = FALSE
+)
+
+for (target_var in target_vars) {
+  for (var in variables) {
+    quantiles <- quantile(dat[[var]], probs = c(0, 1/3, 2/3, 1), na.rm = TRUE)
+
+    # 创建等级变量（3段）
+    dat[[paste0(var, "_ordinal")]] <- cut(
+      dat[[var]],
+      breaks = quantiles,
+      include.lowest = TRUE,
+      labels = c(1, 2, 3)
+    )
+
+    # 区间范围和人数统计
+    t1_range <- sprintf("[%.2f, %.2f]", quantiles[1], quantiles[2])
+    t2_range <- sprintf("(%.2f, %.2f]", quantiles[2], quantiles[3])
+    t3_range <- sprintf("(%.2f, %.2f]", quantiles[3], quantiles[4])
+    #
+    high<-subset(dat,subset=dat$outcome_AHA==1)
+    low<- subset(dat,subset = dat$outcome_AHA==0)
+    t1_count_low <- sum(low[[var]] <= quantiles[2], na.rm = TRUE)
+    t2_count_low <- sum(low[[var]] > quantiles[2] & low[[var]] <= quantiles[3], na.rm = TRUE)
+    t3_count_low <- sum(low[[var]] > quantiles[3], na.rm = TRUE)
+    t1_count_high <- sum(high[[var]] <= quantiles[2], na.rm = TRUE)
+    t2_count_high <- sum(high[[var]] > quantiles[2] & high[[var]] <= quantiles[3], na.rm = TRUE)
+    t3_count_high <- sum(high[[var]] > quantiles[3], na.rm = TRUE)
+    options(survey.lonely.psu = "adjust")
+    study_design <- svydesign(
+      data = dat,
+      id = ~SDMVPSU,
+      strata = ~SDMVSTRA,
+      weights = ~weightnew,
+      nest = TRUE)
+    # 模型 1：等级自变量回归分析（以 t1 为参考组）
+    formula_ordinal <- as.formula(paste0(
+      target_var, " ~ ", var, "_ordinal+sex+age+pir+education+marital+race"
+    ))
+    model_ordinal <- svyglm(formula_ordinal, design = study_design, family = quasibinomial())
+
+    # 提取 OR 和 95% CI
+    coef_ordinal <- summary(model_ordinal)$coefficients
+    OR_t2 <- exp(coef_ordinal[paste0(var, "_ordinal2"), "Estimate"])
+    CI_t2_lower <- exp(coef_ordinal[paste0(var, "_ordinal2"), "Estimate"] - 1.96 * coef_ordinal[paste0(var, "_ordinal2"), "Std. Error"])
+    CI_t2_upper <- exp(coef_ordinal[paste0(var, "_ordinal2"), "Estimate"] + 1.96 * coef_ordinal[paste0(var, "_ordinal2"), "Std. Error"])
+    p_t2 <- coef_ordinal[paste0(var, "_ordinal2"), "Pr(>|t|)"]
+
+    OR_t3 <- exp(coef_ordinal[paste0(var, "_ordinal3"), "Estimate"])
+    CI_t3_lower <- exp(coef_ordinal[paste0(var, "_ordinal3"), "Estimate"] - 1.96 * coef_ordinal[paste0(var, "_ordinal3"), "Std. Error"])
+    CI_t3_upper <- exp(coef_ordinal[paste0(var, "_ordinal3"), "Estimate"] + 1.96 * coef_ordinal[paste0(var, "_ordinal3"), "Std. Error"])
+    p_t3 <- coef_ordinal[paste0(var, "_ordinal3"), "Pr(>|t|)"]
+
+    # 替换变量值为中位数
+    medians <- c(
+      median(dat[[var]][dat[[var]] <= quantiles[2]], na.rm = TRUE),
+      median(dat[[var]][dat[[var]] > quantiles[2] & dat[[var]] <= quantiles[3]], na.rm = TRUE),
+      median(dat[[var]][dat[[var]] > quantiles[3]], na.rm = TRUE)
+    )
+    dat[[paste0(var, "_continuous")]] <- NA
+    dat[[paste0(var, "_continuous")]][dat[[paste0(var, "_ordinal")]] == 1] <- medians[1]
+    dat[[paste0(var, "_continuous")]][dat[[paste0(var, "_ordinal")]] == 2] <- medians[2]
+    dat[[paste0(var, "_continuous")]][dat[[paste0(var, "_ordinal")]] == 3] <- medians[3]
+    options(survey.lonely.psu = "adjust")
+    study_design <- svydesign(
+      data = dat,
+      id = ~SDMVPSU,
+      strata = ~SDMVSTRA,
+      weights = ~weightnew,
+      nest = TRUE)
+    # 连续变量回归分析
+    formula_continuous <- as.formula(paste0(
+      target_var, " ~ ", var, "_continuous+sex+age+pir+education+marital+race"
+    ))
+    model_continuous <- svyglm(formula_continuous, design = study_design, family = quasibinomial())
+
+    # 提取连续变量的 OR 和 95% CI
+    coef_continuous <- summary(model_continuous)$coefficients
+    OR_continuous <- exp(coef_continuous[paste0(var, "_continuous"), "Estimate"])
+    CI_continuous_lower <- exp(coef_continuous[paste0(var, "_continuous"), "Estimate"] - 1.96 * coef_continuous[paste0(var, "_continuous"), "Std. Error"])
+    CI_continuous_upper <- exp(coef_continuous[paste0(var, "_continuous"), "Estimate"] + 1.96 * coef_continuous[paste0(var, "_continuous"), "Std. Error"])
+    p_continuous <- coef_continuous[paste0(var, "_continuous"), "Pr(>|t|)"]
+
+    # 保存结果
+    sensitivity_results <- rbind(
+      sensitivity_results,
+      data.frame(
+        outcome = target_var,
+        var = var,
+        t1_range = t1_range,
+        t2_range = t2_range,
+        t3_range = t3_range,
+        t1_count_low = t1_count_low,
+        t2_count_low = t2_count_low,
+        t3_count_low = t3_count_low,
+        t1_count_high = t1_count_high,
+        t2_count_high = t2_count_high,
+        t3_count_high = t3_count_high,
+        t1_median = medians[1],
+        t2_median = medians[2],
+        t3_median = medians[3],
+        OR_t2 = OR_t2,
+        CI_t2_lower = CI_t2_lower,
+        CI_t2_upper = CI_t2_upper,
+        p_t2 = p_t2,
+        OR_t3 = OR_t3,
+        CI_t3_lower = CI_t3_lower,
+        CI_t3_upper = CI_t3_upper,
+        p_t3 = p_t3,
+        OR_continuous = OR_continuous,
+        CI_continuous_lower = CI_continuous_lower,
+        CI_continuous_upper = CI_continuous_upper,
+        p_continuous = p_continuous,
+        stringsAsFactors = FALSE
+      )
+    )
+  }
+}
+write.csv(sensitivity_results, "sensitivity_model1.csv", row.names = FALSE)
+
+# curde model 
+sensitivity_results <- data.frame(
+  outcome = character(),
+  var = character(),
+  t1_range = character(),
+  t2_range = character(),
+  t3_range = character(),
+  t1_count_low = numeric(),
+  t2_count_low = numeric(),
+  t3_count_low = numeric(),
+  t1_count_high = numeric(),
+  t2_count_high = numeric(),
+  t3_count_high = numeric(),
+  t1_median = numeric(),
+  t2_median = numeric(),
+  t3_median = numeric(),
+  OR_t2 = numeric(),
+  CI_t2_lower = numeric(),
+  CI_t2_upper = numeric(),
+  p_t2 = numeric(),
+  OR_t3 = numeric(),
+  CI_t3_lower = numeric(),
+  CI_t3_upper = numeric(),
+  p_t3 = numeric(),
+  OR_continuous = numeric(),
+  CI_continuous_lower = numeric(),
+  CI_continuous_upper = numeric(),
+  p_continuous = numeric(),
+  stringsAsFactors = FALSE
+)
+
+for (target_var in target_vars) {
+  for (var in variables) {
+    quantiles <- quantile(dat[[var]], probs = c(0, 1/3, 2/3, 1), na.rm = TRUE)
+
+    # 创建等级变量（3段）
+    dat[[paste0(var, "_ordinal")]] <- cut(
+      dat[[var]],
+      breaks = quantiles,
+      include.lowest = TRUE,
+      labels = c(1, 2, 3)
+    )
+
+    # 区间范围和人数统计
+    t1_range <- sprintf("[%.2f, %.2f]", quantiles[1], quantiles[2])
+    t2_range <- sprintf("(%.2f, %.2f]", quantiles[2], quantiles[3])
+    t3_range <- sprintf("(%.2f, %.2f]", quantiles[3], quantiles[4])
+    #
+    high<-subset(dat,subset=dat$outcome_AHA==1)
+    low<- subset(dat,subset = dat$outcome_AHA==0)
+    t1_count_low <- sum(low[[var]] <= quantiles[2], na.rm = TRUE)
+    t2_count_low <- sum(low[[var]] > quantiles[2] & low[[var]] <= quantiles[3], na.rm = TRUE)
+    t3_count_low <- sum(low[[var]] > quantiles[3], na.rm = TRUE)
+    t1_count_high <- sum(high[[var]] <= quantiles[2], na.rm = TRUE)
+    t2_count_high <- sum(high[[var]] > quantiles[2] & high[[var]] <= quantiles[3], na.rm = TRUE)
+    t3_count_high <- sum(high[[var]] > quantiles[3], na.rm = TRUE)
+    options(survey.lonely.psu = "adjust")
+    study_design <- svydesign(
+      data = dat,
+      id = ~SDMVPSU,
+      strata = ~SDMVSTRA,
+      weights = ~weightnew,
+      nest = TRUE)
+    # 模型 1：等级自变量回归分析（以 t1 为参考组）
+    formula_ordinal <- as.formula(paste0(
+      target_var, " ~ ", var, "_ordinal"
+    ))
+    model_ordinal <- svyglm(formula_ordinal, design = study_design, family = quasibinomial())
+
+    # 提取 OR 和 95% CI
+    coef_ordinal <- summary(model_ordinal)$coefficients
+    OR_t2 <- exp(coef_ordinal[paste0(var, "_ordinal2"), "Estimate"])
+    CI_t2_lower <- exp(coef_ordinal[paste0(var, "_ordinal2"), "Estimate"] - 1.96 * coef_ordinal[paste0(var, "_ordinal2"), "Std. Error"])
+    CI_t2_upper <- exp(coef_ordinal[paste0(var, "_ordinal2"), "Estimate"] + 1.96 * coef_ordinal[paste0(var, "_ordinal2"), "Std. Error"])
+    p_t2 <- coef_ordinal[paste0(var, "_ordinal2"), "Pr(>|t|)"]
+
+    OR_t3 <- exp(coef_ordinal[paste0(var, "_ordinal3"), "Estimate"])
+    CI_t3_lower <- exp(coef_ordinal[paste0(var, "_ordinal3"), "Estimate"] - 1.96 * coef_ordinal[paste0(var, "_ordinal3"), "Std. Error"])
+    CI_t3_upper <- exp(coef_ordinal[paste0(var, "_ordinal3"), "Estimate"] + 1.96 * coef_ordinal[paste0(var, "_ordinal3"), "Std. Error"])
+    p_t3 <- coef_ordinal[paste0(var, "_ordinal3"), "Pr(>|t|)"]
+
+    # 替换变量值为中位数
+    medians <- c(
+      median(dat[[var]][dat[[var]] <= quantiles[2]], na.rm = TRUE),
+      median(dat[[var]][dat[[var]] > quantiles[2] & dat[[var]] <= quantiles[3]], na.rm = TRUE),
+      median(dat[[var]][dat[[var]] > quantiles[3]], na.rm = TRUE)
+    )
+    dat[[paste0(var, "_continuous")]] <- NA
+    dat[[paste0(var, "_continuous")]][dat[[paste0(var, "_ordinal")]] == 1] <- medians[1]
+    dat[[paste0(var, "_continuous")]][dat[[paste0(var, "_ordinal")]] == 2] <- medians[2]
+    dat[[paste0(var, "_continuous")]][dat[[paste0(var, "_ordinal")]] == 3] <- medians[3]
+    options(survey.lonely.psu = "adjust")
+    study_design <- svydesign(
+      data = dat,
+      id = ~SDMVPSU,
+      strata = ~SDMVSTRA,
+      weights = ~weightnew,
+      nest = TRUE)
+    # 连续变量回归分析
+    formula_continuous <- as.formula(paste0(
+      target_var, " ~ ", var, "_continuous"
+    ))
+    model_continuous <- svyglm(formula_continuous, design = study_design, family = quasibinomial())
+
+    # 提取连续变量的 OR 和 95% CI
+    coef_continuous <- summary(model_continuous)$coefficients
+    OR_continuous <- exp(coef_continuous[paste0(var, "_continuous"), "Estimate"])
+    CI_continuous_lower <- exp(coef_continuous[paste0(var, "_continuous"), "Estimate"] - 1.96 * coef_continuous[paste0(var, "_continuous"), "Std. Error"])
+    CI_continuous_upper <- exp(coef_continuous[paste0(var, "_continuous"), "Estimate"] + 1.96 * coef_continuous[paste0(var, "_continuous"), "Std. Error"])
+    p_continuous <- coef_continuous[paste0(var, "_continuous"), "Pr(>|t|)"]
+
+    # 保存结果
+    sensitivity_results <- rbind(
+      sensitivity_results,
+      data.frame(
+        outcome = target_var,
+        var = var,
+        t1_range = t1_range,
+        t2_range = t2_range,
+        t3_range = t3_range,
+        t1_count_low = t1_count_low,
+        t2_count_low = t2_count_low,
+        t3_count_low = t3_count_low,
+        t1_count_high = t1_count_high,
+        t2_count_high = t2_count_high,
+        t3_count_high = t3_count_high,
+        t1_median = medians[1],
+        t2_median = medians[2],
+        t3_median = medians[3],
+        OR_t2 = OR_t2,
+        CI_t2_lower = CI_t2_lower,
+        CI_t2_upper = CI_t2_upper,
+        p_t2 = p_t2,
+        OR_t3 = OR_t3,
+        CI_t3_lower = CI_t3_lower,
+        CI_t3_upper = CI_t3_upper,
+        p_t3 = p_t3,
+        OR_continuous = OR_continuous,
+        CI_continuous_lower = CI_continuous_lower,
+        CI_continuous_upper = CI_continuous_upper,
+        p_continuous = p_continuous,
+        stringsAsFactors = FALSE
+      )
+    )
+  }
+}
+write.csv(sensitivity_results, "sensitivity_model_curde.csv", row.names = FALSE)
+```
+
+#4. RCS dose-response
+
+```{r}
+library(survey)
+library(rms)
+library(ggplot2)
+library(dplyr)
+library(splines)
+library(chngpt)
+#setwd("D:/Heart Nhanes Analysis")
+#dat<-read.csv("Fulldata_with_mortality.csv")
+#you may need reload nhanes data
+#you can select independent variable you r interested in 
+dat <- dat %>%
+  mutate(across(c(ALT, ALP, LDH, GGT,AST,Albumin,Globulin
+  ), log))
+rt=dat
+
+weightData=svydesign(id=~SDMVPSU, strata=~SDMVSTRA, weights=~weightnew, nest=TRUE, data=rt, survey.lonely.psu="adjust")
+ori.weight <- 1/(weightData$prob)
+rt$weights <- ori.weight/mean(ori.weight)
+
+target_vars <- c("outcome_AHA")
+
+# 定义自变量列表
+variables <- c('ALP', 'ALT', 'LDH', 'GGT', 'AST', 'Albumin', 'Globulin', 'AST.ALT', 'A.G')
+
+# 初始化存储最佳 k 值的结果表
+
+# 遍历目标变量
+for (target_var in target_vars) {
+  for (var in variables) {
+    # 更新 datadist 配置
+    dd <- rms::datadist(rt)
+    options(datadist = "dd")
+    knots <- wtd.quantile(rt[[var]], weights = rt$weights, 
+                          probs = c(0.05, 0.35, 0.65, 0.95))
+
+    refpoint<-as.numeric(knots[2])
+    # 动态构建公式
+    formula <- as.formula(paste0(target_var, " ~ rcs(", var, ",4)+sex+age+pir+education+marital+race+HDLCholesterol + diabetes + hypertensionstatus + smokingstatus_final"))
+    # 拟合模型
+    res.logitics.rcs <- rms::lrm(formula, data = rt, weights = weights)
+ 
+    # 预测结果
+    pre.logistics <- do.call(rms::Predict, list(res.logitics.rcs, var,  fun=exp, type = "predictions",ref.zero=T))
+    
+    # ANOVA 分析
+    anova <- anova(res.logitics.rcs)
+    Nonlinear <- anova[" Nonlinear", "P"]
+    Nonlinear <- ifelse(Nonlinear < 0.001, "<0.001", sprintf("%.04f", Nonlinear))
+    pOvarAll <- anova[which(row.names(anova) == " Nonlinear") - 1, "P"]
+    pOvarAll <- ifelse(pOvarAll < 0.001, "<0.001", sprintf("%.04f", pOvarAll))
+    
+    # 设置 y 轴范围
+    y_min <- min(pre.logistics$lower) - 0.05
+    y_max <- max(pre.logistics$upper) + 0.05
+    histmax<-max(pre.logistics$upper)
+    x_max<- max(pre.logistics[, 1])+0.05
+    x_min<- min(pre.logistics[, 1])-0.05
+    
+    # 直方图数据
+    hist_data <- ggplot_build(
+      ggplot(rt, aes_string(x = var)) + 
+        geom_histogram(aes(y = after_stat(density)), bins = 20)
+    )$data[[1]]
+    
+    # 密度曲线数据
+    max_density <- max(hist_data$density, na.rm = TRUE)
+    density_data <- density(rt[[var]])
+    density_df <- data.frame(x = density_data$x, y = density_data$y)
+    gap<-(x_max-x_min)/20
+    hist_data <- hist_data %>%
+      mutate(
+        xmin_rivise = x_min + gap * (row_number() - 1)  # row_number()生成行号索引
+      )
+    hist_data <- hist_data %>%
+      mutate(
+        xmax_rivise = x_min + gap * row_number()  # row_number()生成行号索引
+      )
+    # 加权均值和分位数
+    weighted_median <- median(
+      x = rt[[var]],
+      weights = rt$weights,
+      na.rm = TRUE
+    )
+
+    knots_points <- pre.logistics[sapply(knots, function(x) 
+      which.min(abs(pre.logistics[[var]] - x))), ]
+    
+    # 绘制图形
+    if (var %in% c('ALP', 'ALT', 'LDH', 'GGT', 'AST')) {
+      independent = paste0("ln(", var, "[IU/L])")
+    }
+    if (var %in% c('Albumin', 'Globulin')) {
+      independent = paste0("ln(", var, "[g/dl])")
+    }
+    if (var %in% c('AST.ALT')) {
+      independent = 'AST/ALT'
+    }
+    if (var %in% c('A.G')) {
+      independent = 'A/G'
+    }
+    if (target_var %in% c('outcome_CVH')){
+      outcome = 'CVH'
+    }
+    if (target_var %in% c('outcome_FHS')){
+      outcome='FHS Risk'
+    }
+    if (target_var %in% c('outcome_AHA')){
+      outcome='Hard ASCVD Risk'
+    }
+    
+    rcs <- ggplot() +
+      geom_rect(
+        data = hist_data,
+        aes(xmin = xmin, xmax =xmax , ymin = y_min, 
+            ymax = y_min + density * (y_max - y_min) / 1.2 / max(density)),
+        fill = "#eaeaf2", alpha = 1, color = NA
+      ) +
+      theme_minimal() +
+      geom_line(data = pre.logistics, aes_string(x = var, y = "yhat"), 
+                color = "#0072b5", linewidth = 1, alpha = 1) +
+      geom_ribbon(data = pre.logistics, aes_string(x = var, ymin = "lower", ymax = "upper"),
+                  fill = "#b4e0f6", alpha = 0.5) +
+      geom_hline(yintercept = 1, linetype = "dashed", color = "purple") +
+      geom_vline(xintercept = weighted_median, linetype = 'dashed', color = 'purple') +
+      geom_text(aes(x = weighted_median, y = y_min, label = sprintf("Ref_median: %.4f", weighted_median)),
+                color = "purple", vjust = 1.5, size = 4) +  # 调整字体大小
+      geom_point(data = knots_points, aes_string(x = var, y = "yhat"), 
+                 color = "red", size = 1.5, alpha = 1, shape = 16) +
+      geom_text(aes(x = Inf, y = Inf,
+                    label = sprintf("P-overall: %s\nP-non-linear: %s", pOvarAll, Nonlinear)),
+                hjust = 1.1, vjust = 1.5, size = 8) +  # 调整字体大小
+      coord_cartesian(ylim = c(y_min, y_max)) +
+      scale_y_continuous(name = "OR (95% CI)") +
+      scale_x_continuous(paste0(outcome," Vs. ",independent)) +
+      theme_bw() +
+      theme(
+        panel.grid = element_blank(),
+        panel.border = element_blank(),
+        axis.line = element_line(),
+          # 调整坐标轴标题字体大小,
+        text = element_text(family = "Arial"),
+        axis.title = element_text(size = 14, family = "Arial"),  # 确保坐标轴标题使用Arial
+        axis.text = element_text(size = 12, family = "Arial"),   # 确保坐标轴刻度使用Arial
+        legend.text = element_text(size = 12, family = "Arial"), # 确保图例文字使用Arial
+        legend.title = element_text(size = 14, family = "Arial") # 调整图例标题字体大小
+      )
+
+# 保存图形，调整图像尺寸
+ggsave(paste0(var, "VS.", target_var, "_RCS.tiff"), plot = rcs, dpi = 1600, width = 8, height = 6, units = "in")
+      cat(sprintf("变量 %s 的 %s 图形已保存。\n", target_var,'VS.',var))
+      }
+}
+```
+
+#5. mediation effect
+
+```{r}
+library(MASS)
+library(bda)
+library(mediation)
+library(survey)
+library(dplyr)
+dat <- dat %>%
+   mutate(across(c(ALT, ALP, LDH, GGT,AST,Albumin,Globulin
+  
+   ), log))
+study_design<- svydesign(data = dat,
+                         id=~SDMVPSU,
+                         strata = ~SDMVSTRA,
+                         weights = ~weightnew,
+                         nest = TRUE)
+
+rt=dat
+#rt$GGT
+rt$HbA1c_percentage
+weightData=svydesign(id=~SDMVPSU, strata=~SDMVSTRA, weights=~weightnew, nest=TRUE, data=rt, survey.lonely.psu="adjust")
+ori.weight <- 1/(weightData$prob)
+rt$weights <- ori.weight/mean(ori.weight)
+summary(dat$GGT)
+
+#regarding the mediation model the covariates are sex age race hdl hbA1c sbp and HDL 
+#fit1<- glm(outcome_AHA~GGT+sex+age+race+HDL, rt,weights = rt$weights,family = quasibinomial())
+#summary(fit1)
+#rt$Mean_SBP
+fit2<- glm(Mean_SBP~ GGT+sex+age+race+HbA1c_percentage+HDL, weights = rt$weights, rt,family=gaussian())
+summary(fit2)
+#rt$outcome_AHA<-as.factor(rt$outcome_AHA)
+fit3<- glm(outcome_AHA~HbA1c_percentage+GGT+sex+age+race+HDL+Mean_SBP, rt,weights = rt$weights,family =quasibinomial())
+summary(fit3)
+
+model<- mediate(fit2,fit3,treat = 'GGT',mediator = 'Mean_SBP',boot = T,sims = 1000)
+summary(model)
+#you can change the Mean_SBP to the HbA1c or HDL
+```

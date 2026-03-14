@@ -1,0 +1,409 @@
+---
+title: "Machine Learning validation for nhanes and charls"
+author: "Chenglin Liu"
+date: "2025-09-30"
+output: html_document
+---
+#1.LASSO
+```{r}
+setwd('C:/0822/New')
+library(MatchIt)
+library(cobalt)
+library(foreign)
+library(dplyr)
+library(arsenal)
+library(survey)
+library(tableone)
+library(mgcv)
+library(modelsummary)
+library(splines)
+library(writexl)
+library(purrr)
+library(car)
+library(patchwork)
+#write.csv(dat,file='Fulldata_with_mortality.csv',row.names=FALSE)
+#dat<-read.csv('AHAmetadata.csv')
+dat<-read.csv('nhanes.csv')
+
+dat$outcome_AHA<- case_when(
+  dat$AHA>0.075 ~ 1,
+  dat$AHA<0.075 ~ 0
+)
+dat$hypertensionstatus<- case_when(
+  dat$Mean_DBP>90 | dat$Mean_SBP >140 ~ 1,
+  dat$Hypertensiontreated=='YES' ~1,
+  TRUE~ 0
+  )
+dat$HDL<-dat$HDLCholesterol
+table(dat$hypertensionstatus,useNA = 'ifany')
+
+#install.packages("glmnet")
+#colnames(dat)
+#options(repos=structure(c(CRAN="https://mirrors.tuna.tsinghua.edu.cn/CRAN/"))) 
+library(glmnet)
+setwd('C:/0822/New')
+library(dplyr)
+
+dat<-na.omit(dat)
+dat <- dat %>%
+  mutate(across(c(ALT, ALP, LDH, GGT,AST,Albumin,Globulin
+                  
+  ), log))
+
+dat$sex<-ifelse(dat$sex=='Female',0,1) ##女人变成1男人变成0
+
+dat$diabetes<-ifelse(dat$diabetes=='YES',1,0)
+
+dat$Hypertensiontreated<-ifelse(dat$Hypertensiontreated=='YES',1,0)
+dat$drink<-ifelse(dat$drink=='YES',0,1)
+dat$smokingstatus_final<-case_when(
+  dat$smokingstatus_final=='Never smoke'~0,
+  dat$smokingstatus_final=='Quit >5y' ~1,
+  dat$smokingstatus_final=='Quit 1~5y'~2,
+  dat$smokingstatus_final=='Quit <1y'~3,
+  dat$smokingstatus_final=='Current smoke'~4
+)
+dat$education<- case_when(
+  dat$education=='Less than 9th grade' ~1,
+  dat$education=='9-11th grade'~2,
+    dat$education=='High school graduate/GED or equivalent'~3,
+    dat$education=='Some college or AA degree'~4,
+    dat$education=='College graduate or above'~5
+)
+dat$race<- case_when(
+  dat$race == "Non-Hispanic Black"~1,
+  TRUE ~0
+)
+dat$marital<-ifelse(dat$marital=='YES',1,0)
+y<-as.matrix(dat$outcome_AHA)
+colnames(dat)
+x<-as.matrix(dat[,-c(1,2,3,4,7,8,15,27,30,31,34,38,41,42,40,29)])
+#table(dat$triglicerides,useNA = 'ifany')
+set.seed(120)
+##lasso
+lassomod<-glmnet(x,y,family='binomial',alpha = 1)
+print(lassomod)
+#DF模型自由度，自变量个数，%dev模型拟合优度越接近1越好#lamada正则化参数，
+tiff("lassopath.tiff", width = 7, height = 5, units = "in", res = 1000)
+plot(lassomod,xvar = 'lambda',label = F)
+dev.off()
+coef_lasso<-glmnet::coef.glmnet(lassomod,s=0.00100)
+coef_lasso
+cv_mod<-cv.glmnet(x,y,family='binomial',alpha=1,nfolds = 10)
+#tiff("lasso.tiff", width = 7, height = 5, units = "in", res = 1000)
+plot(cv_mod)
+#dev.off()
+lambda_min<-cv_mod$lambda.min
+lambda_1se<-cv_mod$lambda.1se
+lambda_min
+lambda_1se
+
+
+coef_lasso<-glmnet::coef.glmnet(lassomod,s=lambda_1se)
+coef_lasso<-as.matrix(coef_lasso)
+coef_lasso<-data.frame(coef_lasso)
+coef_lasso
+coef_lasso$OR<-exp(coef_lasso)
+nonzero_var<-rownames(coef_lasso[coef_lasso$OR!=1,])
+
+nonzero_var
+#[1] "(Intercept)"         "age"                 "sex"                 "HDLCholesterol"      "Mean_SBP"            "ALT"                
+#[7] "ALP"                 "GGT"                 "AST"                 "smokingstatus_final" "nonHDL"              "Hypertensiontreated"
+#[13] "HbA1c_percentage"    "bmi"                 "triglyceride"        "Globulin"            "drink"      
+Lasso<- c("age"      ,           "sex"       ,          "HDLCholesterol"   ,   "Mean_SBP"      ,      "ALT"    ,            
+          "ALP"         ,        "GGT"           ,      "AST"          ,       "smokingstatus_final" ,"nonHDL"  ,            "Hypertensiontreated",
+           "HbA1c_percentage"  ,  "bmi"       ,          "triglyceride" ,       "Globulin"       ,     "drink" )
+#`Multivariate model 1`<-c("ALP","GGT","Globulin","AST/ALT",'A/G')
+
+##绘制弦图
+# 定义两个集合
+Lasso <- c("age", "sex", "HDL", "SBP", "ALT", 
+           "ALP", "GGT", "AST", "smoke", "nonHDL", 
+           "HTN", "HbA1c%", "bmi", 
+           "TG", "Globulin", "alcohol")
+
+Multivariate_model_1 <- c("ALP", "GGT", "Globulin", "AST/ALT", "A/G")
+
+# 创建连接矩阵
+# 首先创建所有节点的列表
+all_nodes <- c("Lasso", "Multivariate model 1", Lasso, Multivariate_model_1)
+all_nodes <- unique(all_nodes) # 去除重复项
+
+# 创建空矩阵
+mat <- matrix(0, nrow = length(all_nodes), ncol = length(all_nodes),
+              dimnames = list(all_nodes, all_nodes))
+
+# 填充连接矩阵
+# Lasso集合连接
+for (item in Lasso) {
+  mat["Lasso", item] <- 1
+  mat[item, "Lasso"] <- 1
+}
+
+# Multivariate model 1集合连接
+for (item in Multivariate_model_1) {
+  mat["Multivariate model 1", item] <- 1
+  mat[item, "Multivariate model 1"] <- 1
+}
+
+# 确定交集元素
+intersection <- intersect(Lasso, Multivariate_model_1)
+
+# 创建颜色映射
+# 为每个节点分配颜色
+node_colors <- structure(
+  c("#1f77b4", "#ff7f0e",  # 两个集合的颜色
+    rep("#1f77b4", length(Lasso)),  # Lasso元素的颜色
+    rep("#ff7f0e", length(Multivariate_model_1))),  # Multivariate model 1元素的颜色
+  names = c("Lasso", "Multivariate model 1", Lasso, Multivariate_model_1)
+)
+
+# 对交集元素使用特殊颜色
+node_colors[intersection] <- "#2ca02c"
+
+# 使用TIFF格式保存图像
+tiff("chord_diagram.tiff", 
+     width = 10, height = 8, units = "in", res = 1000, 
+     compression = "lzw", bg = "white")
+
+
+# 创建弦图
+chordDiagram(mat, 
+             grid.col = node_colors,
+             transparency = 0.5,
+             annotationTrack = c("name", "grid"),
+             preAllocateTracks = list(track.height = 0.1))
+
+# 添加标题
+
+# 添加图例
+legend("bottomright", 
+       legend = c("Lasso", "Multivariate Model 1 for biomarkers", "Biomarkers of intersection"),
+       fill = c("#1f77b4", "#ff7f0e", "#2ca02c"),
+       border = NA,
+       bty = "n",
+       cex = 1.2)
+
+# 关闭图形设备
+dev.off()
+```
+
+
+#2.CHARLS data imputation
+```{r}
+dat<- read_dta('fullcharls.dta')
+dat0<- merge(dat,bmi,by='ID',all.x = T)
+dat0<-na.omit(dat0)
+dat0$bmi<- case_when(
+  dat0$bmi>100 & dat0$bmi<1000 ~ dat0$bmi/10,
+  dat0$bmi>100000 ~ dat0$bmi/10000,
+  TRUE~dat0$bmi
+)
+dat0$bmi<- case_when(
+  dat0$bmi<10 ~ dat0$bmi*10,
+  TRUE~dat0$bmi
+)
+#write_dta(dat0,'charlsbmi.dta')
+
+library(haven)
+library(dplyr)
+setwd('C:\\0822\\New')
+charls<- read_dta('charlsbmi.dta')
+nhanes<- read.csv('nhanes.csv')
+
+#model<- glm(GGT~AHA)
+nhanes <- nhanes %>%
+  mutate(across(c(ALT, ALP, LDH, GGT,AST,Albumin,Globulin
+                  
+  ), log))
+
+##knn插补法
+nhanes$ID<- nhanes$SEQN
+charls_re<- charls
+charls_re$survtime<-NULL
+charls_re$condition<-NULL
+charls_re$cancer<-NULL
+charls_re$CVD<-NULL
+charls_re$stroke<-NULL
+charls_re$GGT<- NA
+charls_re$Globulin<- NA
+charls_re$ALP<- NA
+charls_re$outcome_AHA<-NULL
+charls_re$hypertensionstatus<-NULL
+charls_re$triglicerides<-NULL
+col<- colnames(charls_re)
+nhanes_re<- nhanes[,col]
+
+alldata<- rbind(nhanes_re,charls_re)
+library(mice)
+
+library(miceadds)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(cowplot)
+library(naniar)
+library(plotly)
+library(VIM)
+#KNN插补法针对连续变量大量缺失
+dat5_imputed <- kNN(alldata, variable = c('GGT','Globulin','ALP'),k =2)
+
+
+tiff(filename = "imputation.tiff", width = 8, height = 8, units = "in", res = 1200)
+par(mfrow = c(3, 2))
+hist(alldata$GGT, main = "Before Imputation",xlab = 'GGT')
+hist(dat5_imputed$GGT, main = "After KNN Imputation",xlab = 'GGT',ylab = '')
+hist(alldata$Globulin, main = "",xlab = 'Globulin')
+hist(dat5_imputed$Globulin, main = "",xlab = 'Globulin',ylab = '')
+hist(alldata$ALP, main = "",xlab = 'ALP')
+hist(dat5_imputed$ALP, main = "",xlab = 'ALP',ylab = '')
+dev.off()
+alldata$GGT<- dat5_imputed$GGT
+alldata$Globulin<- dat5_imputed$Globulin
+alldata$ALP<- dat5_imputed$ALP
+charls_new<- charls[,c('ID','condition','survtime','outcome_AHA')]
+all<- merge(alldata,charls_new,by='ID',all.y = T)
+#write_dta(all,'fullcharlsr2.dta')
+
+```
+#3. CHARLS machine learing and NHAENS as external validation
+```{r}
+library(dplyr)
+library(haven)
+library(Mime1)
+setwd('C:\\0822\\New')
+nhanes<- read.csv("nhanes.csv")
+
+
+
+nhanes$outcome_AHA<- case_when(
+  nhanes$AHA>0.075 ~ 1,
+  nhanes$AHA<0.075 ~ 0
+)
+nhanes$Var<- nhanes$outcome_AHA
+nhanes$ID<- nhanes$SEQN
+dat<- read_dta('fullcharlsr2.dta')
+
+
+dat0<-read_dta('charls2011r1.dta')
+dat0$ID<- dat0$new_ID
+tri<-dat0[,c('ID','triglicerides')]
+dat<- merge(tri,dat,by='ID',all.y = T)
+
+nhanes$triglicerides<-nhanes$triglyceride
+dat$condition<- case_when(
+  dat$condition == 'ASCVD'~1,
+  TRUE~0
+)
+dat$Var<- dat$condition
+#triglyceride
+
+target_cols <- c("ID", "Var")
+
+# 获取其他列的列名
+other_cols <- setdiff(colnames(dat), target_cols)
+
+# 重新排列列的顺序
+dat <- dat[, c(target_cols, other_cols)]
+dat$nonHDL<- dat$TotalCholesterol-dat$HDLCholesterol
+colnames(dat)
+
+dat<-dat[,c(1,2,3,7,8,9,12,13,14,15,17,20,21,22,23,27)]
+newcol<-colnames(dat)
+nhanes<- nhanes[,newcol]
+nhanes$Var<- as.factor(case_when(nhanes$Var == "1"~"Y",
+                       TRUE~'N'))
+dat$smokingstatus_final<-as.numeric(case_when(
+  dat$smokingstatus_final=='Never smoke'~0,
+  dat$smokingstatus_final=='Quit >5y' ~1,
+  dat$smokingstatus_final=='Quit 1~5y'~2,
+  dat$smokingstatus_final=='Quit <1y'~3,
+  dat$smokingstatus_final=='Current smoke'~4,
+  TRUE~NA
+))
+dat$drink<-ifelse(dat$drink=='YES',1,0)
+dat$sex<-ifelse(dat$sex=='Female',0,1)
+dat$Hypertensiontreated<-ifelse(dat$Hypertensiontreated=='NO',0,1)
+colnames(dat)
+dat$HbA1cpercentage<-dat$HbA1c_percentage
+dat$smokingstatusfinal<- dat$smokingstatus_final
+dat$MeanSBP<- dat$Mean_SBP
+#dat$MeanDBP<- dat$Mean_DBP
+#dat$Mean_DBP<-NULL 
+dat$Mean_SBP<-NULL
+dat$smokingstatus_final<-NULL
+dat$HbA1c_percentage<-NULL
+#nhanes
+nhanes$smokingstatus_final<-as.numeric(case_when(
+  nhanes$smokingstatus_final=='Never smoke'~0,
+  nhanes$smokingstatus_final=='Quit >5y' ~1,
+  nhanes$smokingstatus_final=='Quit 1~5y'~2,
+  nhanes$smokingstatus_final=='Quit <1y'~3,
+  nhanes$smokingstatus_final=='Current smoke'~4,
+  TRUE~NA
+))
+#nhanes$diabetes<-ifelse(nhanes$diabetes=='YES',1,0)
+nhanes$sex<-ifelse(nhanes$sex=='Female',0,1)
+nhanes$Hypertensiontreated<-ifelse(nhanes$Hypertensiontreated=='NO',0,1)
+colnames(nhanes)
+nhanes$HbA1cpercentage<-nhanes$HbA1c_percentage
+nhanes$smokingstatusfinal<- nhanes$smokingstatus_final
+nhanes$MeanSBP<- nhanes$Mean_SBP
+#nhanes$MeanDBP<- nhanes$Mean_DBP
+#nhanes$Mean_DBP<-NULL
+nhanes$Mean_SBP<-NULL
+nhanes$smokingstatus_final<-NULL
+nhanes$HbA1c_percentage<-NULL
+nhanes$drink<-ifelse(nhanes$drink=='YES',1,0)
+set.seed(1234)
+
+library(caret)
+train_index <- createDataPartition(dat$Var, 
+                                   p = 0.6, 
+                                   list = FALSE, 
+                                   times = 1)
+dat$Var<- as.factor(case_when(dat$Var == "1" ~"Y",
+                       TRUE~'N'))
+# 创建训练集和测试集
+train <- dat[train_index, ]
+test <- dat[-train_index, ]
+list_train_vali_Data<- list("Charls_train"=train,'Charls_test'=test,'NHANES_vali'=nhanes)
+
+
+colnames(list_train_vali_Data[["Charls_train"]])
+
+genelist<-c(  "age"    ,             "sex"    ,             "HDLCholesterol"  ,    "MeanSBP"    ,               
+            "ALP"       ,          "GGT"          ,           "smokingstatusfinal","nonHDL"  ,            "Hypertensiontreated"
+            ,"HbA1cpercentage"  ,  "bmi"   ,              "triglicerides"  ,      "Globulin"     ,       "drink"   )
+
+library(tidyverse)
+library(caret)
+library(randomForestSRC)
+list_train_vali_Data[["Charls_train"]]<- as.data.frame(list_train_vali_Data[["Charls_train"]])
+list_train_vali_Data[["Charls_test"]]<- as.data.frame(list_train_vali_Data[["Charls_test"]])
+list_train_vali_Data[["NHANES_vali"]]<- as.data.frame(list_train_vali_Data[["NHANES_vali"]])
+#list_train_vali_Data
+source("sor.R")
+#This function is changed by us to save time.
+res.ici <- ML.Dev.Pred.Category.Sigs2(train_data = list_train_vali_Data$Charls_train,
+                                    list_train_vali_Data = list_train_vali_Data,
+                                    candidate_genes = genelist,
+                                    
+                                    seed = 524
+)
+
+#saveRDS(res.ici,'ml.rds')
+res<- readRDS('ml.rds')
+
+plot_list<-list()
+methods <- c('nb','svmRadialWeights','rf','kknn')
+par(mfrow = c(1, 4))
+for (i in methods) {
+  plot_list[[i]]<-roc_vis_category(res,model_name = i,dataset = c("Charls_train","Charls_test",'NHANES_vali'),
+                                   order= c("Charls_train","Charls_test",'NHANES_vali'),
+                                   anno_position=c(0.4,0.25))
+}
+tiff(filename = "ROCfor2.tiff", width = 18, height = 6, units = "in", res = 1200)
+aplot::plot_list(gglist=plot_list,ncol=4)
+dev.off()
+```

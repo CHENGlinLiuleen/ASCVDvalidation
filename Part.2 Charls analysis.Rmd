@@ -1,0 +1,252 @@
+---
+title: "Charls"
+author: "Chenglin Liu"
+date: "2025-09-30"
+output: html_document
+---
+#1.Risk score Dose-response RCS curve in CHARLs
+```{r}
+library(Mime1)
+library(haven)
+library(caret)
+library(dplyr)
+setwd('C:\\0822\\New')
+library(plotRCS)
+
+
+
+dat<- read_dta('fullcharls.dta')
+dat$condition<- case_when(
+  dat$condition == 'ASCVD'~1,
+  TRUE~0
+)
+
+mean_x <- mean(dat$AHA, na.rm = TRUE)
+sd_x <- sd(dat$AHA, na.rm = TRUE)
+lower_bound <- mean_x - 3 * sd_x
+upper_bound <- mean_x + 3 * sd_x
+
+mydata_clean <- dat %>%
+  drop_na(AHA) %>%
+  filter(AHA >= lower_bound & AHA <= upper_bound)
+mydata_clean$condition<-as.factor(mydata_clean$condition)
+mydata_clean$outcome_AHA<- as.factor(mydata_clean$outcome_AHA)
+mydata_clean$AHA<- log(mydata_clean$AHA)
+mydata_clean$outcome_AHA<- case_when(
+  mydata_clean$outcome_AHA == "0" ~ 'Risk score <7.5%',
+  TRUE~'Risk score ≥7.5%'
+)
+library(extrafont)
+
+p1<-rcsplot(data = mydata_clean,
+        outcome = "condition",
+        time = "survtime",
+        exposure = "GGT",
+        group = "outcome_AHA",
+        covariates = c("sex",'age','outcome_AHA'),
+        xlab = "ln(Risk score)"
+        )+
+  # 修改图例标题 - 根据您的图例类型选择合适的方法
+  # 如果图例是基于颜色的
+  labs(color = "Risk group") +
+  # 或者如果图例是基于填充的
+  labs(fill = "Risk group") +
+
+  # 应用Arial字体
+  theme(text = element_text(family = "Arial"),
+        legend.title = element_text(family = "Arial"),
+        legend.text = element_text(family = "Arial"))
+ggsave(
+  filename = "RCS_charls.tiff",
+  plot = p1,
+  device = "tiff",
+  dpi = 1200,                  # 高分辨率
+  width = 8,                  # 宽度（英寸）
+  height = 6,                 # 高度（英寸）
+  units = "in"         # 压缩算法（可选"none", "rle", "lzw", "jpeg", "zip")
+)
+```
+#2.confusion Matrix
+```{r}
+library(caret)
+library(ggplot2)
+dat<- read_dta('fullcharls.dta')
+dat$condition<- case_when(
+  dat$condition == 'ASCVD'~1,
+  TRUE~0
+)
+
+
+#
+# 创建混淆矩阵
+confusion_matrix <- confusionMatrix(
+  data = as.factor(dat$outcome_AHA), 
+  reference = as.factor(dat$condition)
+)
+
+# 打印混淆矩阵
+print(confusion_matrix)
+
+# 绘制混淆矩阵热图
+plt <- as.data.frame(confusion_matrix$table)
+plt$Prediction <- factor(plt$Prediction, levels = rev(levels(plt$Prediction)))
+
+p1<-ggplot(plt, aes(x = Reference, y = Prediction, fill = Freq)) +
+  geom_tile(color = "white", linewidth = 0.8) + 
+  geom_text(aes(label = Freq), color = "white", size = 6, fontface = "bold") +
+  scale_fill_gradient(
+    low = "#3498db", 
+    high = "#2c3e50",
+    name = "Number"
+  ) +
+  labs(
+    x = "Charls Hard ASCVD outcome", 
+    y = "10-year Hard ASCVD Risk classifcation"
+  ) +
+  theme_minimal() +
+  theme(
+    text = element_text(family = "sans"),  # 使用系统默认无衬线字体
+    axis.text = element_text(size = 12, color = "black"),
+    axis.title = element_text(size = 14, face = "bold", color = "black"),
+    plot.title = element_text(size = 18, face = "bold", hjust = 0.5, color = "black", margin = margin(b = 15)),
+    legend.title = element_text(size = 12, face = "bold"),
+    legend.text = element_text(size = 10),
+    panel.grid = element_blank()
+  ) +
+  coord_fixed(ratio = 1)
+ggsave('confusionmatrix.tiff',p1,width = 6,height = 6,units = 'in',dpi = 1000)
+```
+#3. Survival Machine learning with Mim1 R package
+```{r}
+library(Mime1)
+library(haven)
+library(caret)
+library(dplyr)
+setwd('C:\\0822\\New')
+dat<- read_dta('fullcharls.dta')
+dat$condition<- case_when(
+  dat$condition == 'ASCVD'~1,
+  TRUE~0
+)
+dat$OS<- dat$condition
+dat$OS.time<- dat$survtime
+
+dat$OS.time<- as.numeric(dat$OS.time *30)
+target_cols <- c("ID", "OS.time", "OS")
+
+# 获取其他列的列名
+other_cols <- setdiff(colnames(dat), target_cols)
+
+# 重新排列列的顺序
+dat <- dat[, c(target_cols, other_cols)]
+colnames(dat)
+dat<-dat[,c(1,2,3,7,8,9,11,12,14,15,16,17)]
+dat$smokingstatus_final<-as.numeric(case_when(
+  dat$smokingstatus_final=='Never smoke'~0,
+  dat$smokingstatus_final=='Quit >5y' ~1,
+  dat$smokingstatus_final=='Quit 1~5y'~2,
+  dat$smokingstatus_final=='Quit <1y'~3,
+  dat$smokingstatus_final=='Current smoke'~4,
+  TRUE~NA
+))
+dat$diabetes<-ifelse(dat$diabetes=='YES',1,0)
+dat$sex<-ifelse(dat$sex=='Female',0,1)
+dat$Hypertensiontreated<-ifelse(dat$Hypertensiontreated=='NO',0,1)
+colnames(dat)
+dat$HbA1cpercentage<-dat$HbA1c_percentage
+dat$smokingstatusfinal<- dat$smokingstatus_final
+dat$MeanSBP<- dat$Mean_SBP
+#dat$MeanDBP<- dat$Mean_DBP
+#dat$Mean_DBP<-NULL
+dat$Mean_SBP<-NULL
+dat$smokingstatus_final<-NULL
+dat$HbA1c_percentage<-NULL
+
+set.seed(1234)
+
+train_index <- createDataPartition(dat$OS, 
+                                   p = 0.6, 
+                                   list = FALSE, 
+                                   times = 1)
+
+# 创建训练集和测试集
+train <- dat[train_index, ]
+test <- dat[-train_index, ]
+list_train_vali_Data<- list("train"=train,'test'=test)
+colnames(test)
+library(snowfall)
+library(randomForestSRC)
+sfInit(parallel = T, cpus = 8)
+genelist<-c("age",           "sex"          
+            ,"diabetes"   ,         "Hypertensiontreated" ,"HDLCholesterol"    ,  "TotalCholesterol"  ,  "HbA1cpercentage"    
+            , "smokingstatusfinal" , "MeanSBP"            )
+
+
+#function at 186 line take a long time.
+res <- ML.Dev.Prog.Sig(train_data = list_train_vali_Data$train,
+                       list_train_vali_Data = list_train_vali_Data,
+                       unicox.filter.for.candi = F,
+                       unicox_p_cutoff = 0.05,
+                       candidate_genes = genelist,
+                        single_ml = 'CoxBoost',
+                       mode = 'single',nodesize =5,seed = 52014 )
+sfStop()
+#sfInit should be run when single_ml = 'CoxBoost',you can change the machine learning measures like 'RSF','SetpCox','Superpc'
+#saveRDS(res,'CoxBoost.rds')
+#saveRDS(res,'StepCox.rds')
+#saveRDS(res,'superpc.rds')
+#saveRDS(res,'RSF.rds')
+
+#quick redaing results
+res1<- readRDS('RSF.rds')
+res2<- readRDS('CoxBoost.rds')
+res3<- readRDS('StepCox.rds')
+res4<- readRDS('superpc.rds')
+
+res11<-res1[["Cindex.res"]]
+res22<-res2[["Cindex.res"]]
+res33<-res3[["Cindex.res"]]
+res44<-res4[["Cindex.res"]]
+
+Cindex.res<- rbind(res11,res22,res33,res44)
+
+res <- mapply(c, res1, res2, res3, res4, SIMPLIFY = FALSE)
+res[['Cindex.res']] <- Cindex.res
+#plot1 #
+tiff(filename = '生存分析.tif',width = 6,height = 10,units = 'in',res = 1000 )
+cindex_dis_all(res,validate_set = names(list_train_vali_Data)[-1],order =names(list_train_vali_Data),width = 0.35)
+dev.off()
+cindex_dis_select(res,
+                  model="CoxBoost",
+                  order= names(list_train_vali_Data))
+#plot 2#
+survplot <- vector("list",2) 
+tiff(filename = 'CoxBoost.tif',width = 10,height = 6,units = 'in',res = 1000 )
+for (i in c(1:2)) {
+  print(survplot[[i]]<-rs_sur(res, model_name = "CoxBoost",dataset = names(list_train_vali_Data)[i],
+                              #color=c("blue","green"),
+                              median.line = "hv",
+                              cutoff = 0.5,
+                              conf.int = T,
+                              xlab="Days",pval.coord=c(1000,0.9)))
+}
+aplot::plot_list(gglist=survplot,ncol=2)
+dev.off()
+#plot 3#
+#res.by.ML.Dev.Prog.Sig = res1 or res2 ....
+all.auc.7y <- cal_AUC_ml_res(res.by.ML.Dev.Prog.Sig = res2,train_data = list_train_vali_Data[["train"]],
+                             inputmatrix.list = list_train_vali_Data,mode = 'single',single_ml = 'CoxBoost',AUC_time = 7,
+                             auc_cal_method="KM")
+#plot 4# ROC curve 
+tiff(filename = 'CoxBoost7y.tif',width = 6,height =6,units = 'in',res = 1000 )
+roc_vis(all.auc.7y,
+        model_name = "CoxBoost",
+        dataset = names(list_train_vali_Data),
+        order= names(list_train_vali_Data),
+        anno_position=c(0.65,0.55),
+        year=7)
+dev.off()
+
+
+```
+
